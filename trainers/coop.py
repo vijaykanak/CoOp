@@ -6,12 +6,23 @@ from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
-from dassl.metrics import compute_accuracy
+from dassl.metrics import compute_accuracy, compute_accuracy_i2t
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
+
+import torch.nn.functional as F
+from collections import defaultdict
+import pandas as pd
+
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+import numpy as np
+
+import pandas as pd
+import numpy as np
 
 _tokenizer = _Tokenizer()
 
@@ -115,6 +126,8 @@ class PromptLearner(nn.Module):
         self.name_lens = name_lens
         self.class_token_position = cfg.TRAINER.COOP.CLASS_TOKEN_POSITION
 
+        self.logit_alpha = nn.Parameter(torch.tensor(0.0))   
+
     def forward(self):
         ctx = self.ctx
         if ctx.dim() == 2:
@@ -192,7 +205,9 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image):
+         
+
+    def forward(self, image, return_features=False):
         image_features = self.image_encoder(image.type(self.dtype))
 
         prompts = self.prompt_learner()
@@ -203,9 +218,36 @@ class CustomCLIP(nn.Module):
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
         logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
 
+        if return_features:
+            return image_features, text_features, logit_scale
+
+        logits = logit_scale * image_features @ text_features.t()
         return logits
+
+
+
+def visualize_batch(image, filtered_logits_per_image, filtered_labels, image_mask):
+    # Convert logits to NumPy
+    logits_np = filtered_logits_per_image.detach().cpu().numpy()
+    labels_np = filtered_labels.cpu().numpy()
+
+    # Create a DataFrame for visualization
+    df = pd.DataFrame(logits_np, index=[f"img_{i}_label_{lbl}" for i, lbl in enumerate(labels_np)])
+    df.columns = [f"text_{j}" for j in range(df.shape[1])]
+
+    # Optionally round for better readability
+    pd.set_option('display.width', None)
+    pd.set_option('display.max_rows', None)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.precision', 3)
+    pd.set_option('display.float_format', lambda x: '%.2f' % x)
+
+
+    print("\nFiltered Logits Per Image (Similarity Matrix):")
+    print(df)
+
+    input("\nPress Enter to continue...")
 
 
 @TRAINER_REGISTRY.register()
@@ -263,20 +305,206 @@ class CoOp(TrainerX):
         if prec == "amp":
             with autocast():
                 output = self.model(image)
-                loss = F.cross_entropy(output, label)
-            self.optim.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optim)
-            self.scaler.update()
+                # loss = F.cross_entropy(output, label)
+
+                image_features, text_features, logit_scale = self.model(image, return_features=True)
+
+                # Normalize features (already normalized in model, but ensure here if needed)
+                image_features = F.normalize(image_features, dim=-1)
+                text_features = F.normalize(text_features, dim=-1)
+
+                # Similarity logits: [batch_size, batch_size]
+                logits_per_image = logit_scale * image_features @ text_features.t()
+                logits_per_text = logits_per_image.t()
+
+                # Ground truth: assume i-th image matches i-th text
+                labels = torch.arange(logits_per_image.size(0), device=logits_per_image.device)
+
+                # Symmetric loss (same as used in original CLIP)
+                loss_i2t = F.cross_entropy(logits_per_image, labels)
+                loss_t2i = F.cross_entropy(logits_per_text, labels)
+                loss = (loss_i2t + loss_t2i) / 2
+                self.optim.zero_grad()
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optim)
+                self.scaler.update()
         else:
             output = self.model(image)
-            loss = F.cross_entropy(output, label)
+            # loss = F.cross_entropy(output, label)
+            image_features, text_features, logit_scale = self.model(image, return_features=True)
+
+            # Normalize features (already normalized in model, but ensure here if needed)
+            image_features = F.normalize(image_features, dim=-1)
+            text_features = F.normalize(text_features, dim=-1)
+
+            # Similarity logits: [batch_size, batch_size]
+            logits_per_image = logit_scale * image_features @ text_features.t()
+            logits_per_text = logits_per_image.t()
+
+            print(logits_per_image.shape)
+            print(logits_per_text.shape)
+            print(label.shape)
+
+          
+            # Text to Image loss
+            #############################################################
+            # Step 1: Transpose logits to get text-to-image shape
+            logits_per_text = logits_per_image.T  # Shape: [37, 32]
+
+            # Step 2: Build text → list of image indices mapping
+            text_to_image_indices = defaultdict(list)
+            for img_idx, text_idx in enumerate(label):
+                text_to_image_indices[int(text_idx)].append(img_idx)
+
+            # Step 3: Create soft target matrix [num_texts, num_images]
+            targets_T = torch.zeros_like(logits_per_text)  # [num_texts, num_images]
+            for text_idx, image_list in text_to_image_indices.items():
+                if len(image_list) > 0:
+                    weight = 1.0 / len(image_list)
+                    targets_T[text_idx, image_list] = weight
+
+            # Step 4: Filter rows for texts with atleast one matching image
+            valid_mask = targets_T.sum(dim=1) > 0  
+            filtered_logits_per_text = logits_per_text[valid_mask]
+            filtered_targets = targets_T[valid_mask]
+            filtered_target_indices = filtered_targets.argmax(dim=1)
+
+            # Step 5: Compute soft cross-entropy using KL divergence
+            log_probs = F.log_softmax(filtered_logits_per_text, dim=1)   # log p_model
+            loss_t2i = F.kl_div(log_probs, filtered_targets, reduction='batchmean')
+            
+            #############################################################
+            
+            
+            # Image to text loss
+            #############################################################
+                   
+            
+            # Step 1: Build a mask for images whose label indices is in filtered_target_indices
+            valid_image_indices = set(filtered_target_indices.tolist())  # Convert to set for faster lookup
+
+            # Now build the mask by checking if the index is in valid_image_indices
+            image_mask = torch.tensor([i in valid_image_indices for i in range(len(label))])
+
+            # Step 2: Filter logits and labels
+            filtered_logits_per_image = logits_per_image[image_mask]
+            filtered_labels = label[image_mask]
+
+            # Step 3: Compute cross entropy loss
+            loss_i2t = F.cross_entropy(filtered_logits_per_image, filtered_labels)
+            # loss_i2t = F.cross_entropy(logits_per_image, label)    
+
+            # probs_images = F.softmax(filtered_logits_per_image, dim=1)   # log p_model  
+            probs_images = F.softmax(logits_per_image, dim=1)   # log p_model  
+            image_no_mask = torch.ones(len(label), dtype=torch.bool)
+
+
+            
+          
+
+            num_filtered_logits_per_image = filtered_logits_per_image.shape[0]
+            num_filtered_logits_per_text = filtered_logits_per_text.shape[0]
+
+            
+            print("num_filtered_logits_per_image = ", num_filtered_logits_per_image)
+            print("num_filtered_logits_per_text = ", num_filtered_logits_per_text)
+
+        
+            
+            #############################################################
+            print("Epoch Number: ", self.epoch)
+            print("logit_scale", logit_scale.item())
+            print("Image to text Loss:", loss_i2t.item())
+            print("Text to image Loss:", loss_t2i.item())
+            print("Num Text-Image pairs: ", filtered_target_indices.shape[0]) 
+
+            logits_i2t=logits_per_image
+            logits_t2i=logits_per_image.t()
+
+            loss_i2t_2 = F.cross_entropy(logits_i2t, label)
+            loss_t2i_2 = F.cross_entropy(logits_t2i, label)
+            print("Image to text Loss2:", loss_i2t_2.item())
+            print("Text to image Loss2:", loss_t2i_2.item())
+                 
+                
+
+
+
+            # loss = loss_i2t
+            # loss = loss_t2i
+            # loss = loss_i2t_2
+            # loss = loss_t2i_2
+            loss = (loss_i2t_2 + loss_t2i_2) / 2 
+            # loss = (loss_i2t + loss_t2i) / 2 
+            # alpha=0.9
+            # loss = alpha*loss_i2t + (1-alpha)*loss_t2i 
+
+            # After computing loss_i2t and loss_t2i:
+            # alpha = torch.sigmoid(self.model.prompt_learner.logit_alpha)  # constrains alpha in [0, 1]
+            # alpha = 0.5 + 0.5 * torch.sigmoid(self.model.prompt_learner.logit_alpha)           
+
+            # detach loss_t2i from the graph for alpha
+            # loss = alpha * loss_i2t + (1 - alpha) * loss_t2i.detach()
+
+            # print("alpha: ", alpha.item())     
+
+            # if(self.epoch < 15):
+            #     loss = loss_t2i
+            # else:
+            #     loss = loss_i2t
+
+            # Right after:
+            # filtered_logits_per_image = logits_per_image[image_mask]
+            # filtered_labels = label[image_mask]
+
+            # visualize_batch(image, filtered_logits_per_image, filtered_labels, image_mask)
+
+            # if(self.epoch == 4):
+            #     visualize_batch(image, probs_images, label, image_no_mask)
+
+
             self.model_backward_and_update(loss)
+
+            # # Step 1: Get model outputs
+            # output_batch = self.model(image)  # shape: (batch_size, num_classes)
+            # print("output_batch shape: ", output_batch.shape)
+            # output_ground_truth_full_batch = self.model(self.ground_truth_images)  # shape: (num_classes, num_classes)
+            # print("output_ground_truth_full_batch shape: ", output_ground_truth_full_batch.shape)
+
+            # # Step 2: Select correct rows based on labels
+            # # label_image_batch is assumed to be a tensor of shape (batch_size,) with ground truth labels 0, 1, 2, ...
+            # label_image_batch = label
+            # output_ground_truth_batch = output_ground_truth_full_batch[label_image_batch]  # shape: (batch_size, num_classes)
+            # print("output_ground_truth_batch shape: ", output_ground_truth_batch.shape)
+
+            # # Step 3: Expand output_batch to 3D: (batch_size, num_classes, 1)
+            # output_batch_expanded = output_batch.unsqueeze(2)  # shape: (batch_size, num_classes, 1)
+            # print("output_batch_expanded shape: ", output_batch_expanded.shape)
+
+            # # Step 4: Expand and transpose output_ground_truth_batch to 3D: (batch_size, 1, num_classes)
+            # #reference_column = output_ground_truth_batch.unsqueeze(1)  # shape: (batch_size, 1, num_classes)
+            # reference_column = output_ground_truth_batch.unsqueeze(1)  # shape: (32, 1, 47)
+            # reference_column = reference_column.expand(-1, output_batch.size(1), -1)  # shape: (32, 47, 47)
+            # print("reference_column shape: ", reference_column.shape)
+
+            # # Step 5: Concatenate along the last dimension to get shape: (batch_size, num_classes, num_classes + 1)
+            # output_enhanced_batch = torch.cat([output_batch_expanded, reference_column], dim=2)  # shape: (batch_size, num_classes, num_classes + 1)
+            # print("output_enhanced_batch size: ", output_enhanced_batch.shape)
+
+
+
+        # loss_summary = {
+        #     "loss": loss.item(),
+        #     "acc": compute_accuracy(logits_per_image, label)[0].item(),
+        # }
 
         loss_summary = {
             "loss": loss.item(),
             "acc": compute_accuracy(output, label)[0].item(),
         }
+
+        # topk_accuracy = compute_accuracy(output_enhanced_batch, label)
+        # print("top_1 accuracy = ", topk_accuracy[0].item())
 
         if (self.batch_idx + 1) == self.num_batches:
             self.update_lr()
