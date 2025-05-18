@@ -11,8 +11,9 @@ DATASET=$1
 SEED=$2
 
 # CFG=vit_b16_c4_ep10_batch1_ctxv1
-CFG=vit_b16_ctxv1  # uncomment this when TRAINER=CoOp
-SHOTS=16
+# CFG=vit_b16_ctxv1  # uncomment this when TRAINER=CoOp
+CFG=vit_b16_ep20
+SHOTS=4
 LOADEP=10
 SUB=new
 
