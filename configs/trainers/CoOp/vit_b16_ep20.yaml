@@ -1,10 +1,10 @@
 DATALOADER:
   TRAIN_X:
-    BATCH_SIZE: 47
+    BATCH_SIZE: 8
     SAMPLER: "RandomClassSampler"
     N_INS: 1
   TEST:
-    BATCH_SIZE: 47
+    BATCH_SIZE: 8
     SAMPLER: "RandomClassSampler"    
   NUM_WORKERS: 8
 
@@ -18,7 +18,7 @@ INPUT:
 OPTIM:
   NAME: "sgd"
   LR: 0.001
-  MAX_EPOCH: 40
+  MAX_EPOCH: 20
   LR_SCHEDULER: "cosine"
   WARMUP_EPOCH: 1
   WARMUP_TYPE: "constant"
