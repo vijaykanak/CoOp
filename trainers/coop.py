@@ -391,12 +391,17 @@ class CoOp(TrainerX):
             filtered_labels = label[image_mask]
 
             # Step 3: Compute cross entropy loss
-            loss_i2t = F.cross_entropy(filtered_logits_per_image, filtered_labels)
+            # loss_i2t = F.cross_entropy(filtered_logits_per_image, filtered_labels)
             # loss_i2t = F.cross_entropy(logits_per_image, label)    
 
             # probs_images = F.softmax(filtered_logits_per_image, dim=1)   # log p_model  
             probs_images = F.softmax(logits_per_image, dim=1)   # log p_model  
             image_no_mask = torch.ones(len(label), dtype=torch.bool)
+
+            log_probs_images = F.log_softmax(filtered_logits_per_image, dim=1)   # log p_model
+            num_classes = log_probs_images.size(1)
+            filtered_labels_onehot = F.one_hot(filtered_labels, num_classes=num_classes).float()
+            loss_i2t = F.kl_div(log_probs_images, filtered_labels_onehot, reduction='batchmean')
 
 
             
@@ -421,8 +426,10 @@ class CoOp(TrainerX):
             logits_i2t=logits_per_image
             logits_t2i=logits_per_image.t()
 
-            loss_i2t_2 = F.cross_entropy(logits_i2t, label)
-            loss_t2i_2 = F.cross_entropy(logits_t2i, label)
+            # loss_i2t_2 = F.cross_entropy(logits_i2t, label)
+            # loss_t2i_2 = F.cross_entropy(logits_t2i, label)
+            loss_i2t_2 = loss_i2t
+            loss_t2i_2 = loss_t2i
             print("Image to text Loss2:", loss_i2t_2.item())
             print("Text to image Loss2:", loss_t2i_2.item())
                  
@@ -433,8 +440,8 @@ class CoOp(TrainerX):
             # loss = loss_i2t
             # loss = loss_t2i
             # loss = loss_i2t_2
-            # loss = loss_t2i_2
-            loss = (loss_i2t_2 + loss_t2i_2) / 2 
+            loss = loss_t2i_2
+            # loss = (loss_i2t_2 + loss_t2i_2) / 2 
             # loss = (loss_i2t + loss_t2i) / 2 
             # alpha=0.9
             # loss = alpha*loss_i2t + (1-alpha)*loss_t2i 
