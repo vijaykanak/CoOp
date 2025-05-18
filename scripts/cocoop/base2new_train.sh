@@ -11,9 +11,10 @@ DATASET=$1
 SEED=$2
 
 # CFG=vit_b16_c4_ep10_batch1_ctxv1
-CFG=vit_b16_ctxv1  # uncomment this when TRAINER=CoOp
+# CFG=vit_b16_ctxv1  # uncomment this when TRAINER=CoOp
+CFG=vit_b16_ep20  # uncomment this when TRAINER=CoOp
 # CFG=vit_b16_ep50_ctxv1  # uncomment this when TRAINER=CoOp and DATASET=imagenet
-SHOTS=16
+SHOTS=4
 
 
 DIR=output/base2new/train_base/${DATASET}/shots_${SHOTS}/${TRAINER}/${CFG}/seed${SEED}
