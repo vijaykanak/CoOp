@@ -46,13 +46,14 @@ def load_clip_to_cpu(cfg):
 
 
 class TextEncoder(nn.Module):
-    def __init__(self, clip_model):
+    def __init__(self, clip_model, n_ctx):
         super().__init__()
         self.transformer = clip_model.transformer
         self.positional_embedding = clip_model.positional_embedding
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
+        self.n_ctx = n_ctx
 
     def forward(self, prompts, tokenized_prompts):
         x = prompts + self.positional_embedding.type(self.dtype)
@@ -63,7 +64,11 @@ class TextEncoder(nn.Module):
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+        # x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+
+        eos_position = 1 + self.n_ctx  # assuming EOS is always placed right after context
+        x = x[:, eos_position, :] @ self.text_projection
+
 
         return x
 
@@ -105,6 +110,10 @@ class PromptLearner(nn.Module):
         print(f"Number of context words (tokens): {n_ctx}")
 
         self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+        # Learnable weights for each context token
+        self.ctx_alpha = nn.Parameter(torch.ones(n_ctx, dtype=dtype), requires_grad=True)  # shape (n_ctx,)
+        self.scale_factor=torch.tensor(5.0)
+
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -135,6 +144,8 @@ class PromptLearner(nn.Module):
 
         prefix = self.token_prefix
         suffix = self.token_suffix
+
+        # breakpoint()
 
         if self.class_token_position == "end":
             prompts = torch.cat(
@@ -188,6 +199,66 @@ class PromptLearner(nn.Module):
                 )
                 prompts.append(prompt)
             prompts = torch.cat(prompts, dim=0)
+        elif self.class_token_position == "learnablePos":
+            ctx = self.ctx
+            if ctx.dim() == 2:
+                ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+            # Compute per-token softmax weights            
+            alpha_softmax = F.softmax(self.ctx_alpha * self.scale_factor, dim=0)  # (n_ctx,)
+
+            avg_class_embeddings = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]
+                class_i = self.token_suffix[i : i + 1, :name_len, :]  # (1, name_len, dim)
+                avg_emb = class_i.mean(dim=1)  # (1, dim)
+                avg_class_embeddings.append(avg_emb)
+
+                # # Apply weighted avg_emb to context tokens
+                # for j in range(self.n_ctx):                    
+                #     ctx[i, j, :] = ctx[i, j, :] + alpha[j] * avg_emb
+
+            avg_class_embeddings = torch.cat(avg_class_embeddings, dim=0)  # (n_cls, dim)
+            # ctx: (n_cls, n_ctx, dim)
+            # alpha: (n_ctx,)
+            # avg_class_embeddings: (n_cls, dim)
+
+            # breakpoint()
+
+            # ctx = ctx + alpha.view(1, -1, 1) * avg_class_embeddings.unsqueeze(1)
+            # ctx = ctx + avg_class_embeddings.unsqueeze(1)
+
+            dim = avg_class_embeddings.size(1)
+
+            alpha_exp = alpha_softmax.view(1, self.n_ctx, 1).expand(self.n_cls, self.n_ctx, dim)  # (n_cls, n_ctx, dim)
+            avg_emb_exp = avg_class_embeddings.unsqueeze(1).expand(self.n_cls, self.n_ctx, dim)  # (n_cls, n_ctx, dim)
+
+            ctx = (1 - alpha_exp) * ctx + alpha_exp * avg_emb_exp  # elementwise (n_cls, n_ctx, dim)   
+            
+            # ctx = ctx + avg_class_embeddings.unsqueeze(1)  # (n_cls, n_ctx, dim)
+
+            # Extract EOS token safely
+            eos_token_id = 49407
+            eos_positions = (self.tokenized_prompts == eos_token_id).int().argmax(dim=1)  # (n_cls,)
+            batch_indices = torch.arange(self.n_cls, device=eos_positions.device)
+            eos_embeddings = self.token_suffix[batch_indices, eos_positions - (1 + self.n_ctx), :].unsqueeze(1)  # (n_cls, 1, dim)
+
+            prompts = torch.cat([self.token_prefix, ctx, eos_embeddings], dim=1)
+
+            # Add padding to ensure prompt is of length 77
+            current_len = prompts.shape[1]
+            max_len = 77
+            pad_len = max_len - current_len
+
+            if pad_len > 0:
+                pad_embed = torch.zeros(self.n_cls, pad_len, ctx.shape[-1], dtype=ctx.dtype, device=ctx.device)
+                prompts = torch.cat([prompts, pad_embed], dim=1)
+
+            # prompts is now (n_cls, 77, dim)
+            # print(prompts.shape)
+            # breakpoint()
+
+
 
         else:
             raise ValueError
@@ -199,9 +270,10 @@ class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        # breakpoint()
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
+        self.text_encoder = TextEncoder(clip_model, self.prompt_learner.n_ctx)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
@@ -432,6 +504,10 @@ class CoOp(TrainerX):
             loss_t2i_2 = loss_t2i
             print("Image to text Loss2:", loss_i2t_2.item())
             print("Text to image Loss2:", loss_t2i_2.item())
+
+            alpha2 = F.softmax(self.model.prompt_learner.ctx_alpha * self.model.prompt_learner.scale_factor, dim=0)
+
+            print("Leanrt pos: ", alpha2)
                  
                 
 
@@ -439,8 +515,8 @@ class CoOp(TrainerX):
 
             # loss = loss_i2t
             # loss = loss_t2i
-            # loss = loss_i2t_2
-            loss = loss_t2i_2
+            loss = loss_i2t_2
+            # loss = loss_t2i_2
             # loss = (loss_i2t_2 + loss_t2i_2) / 2 
             # loss = (loss_i2t + loss_t2i) / 2 
             # alpha=0.9
@@ -468,6 +544,9 @@ class CoOp(TrainerX):
 
             # if(self.epoch == 4):
             #     visualize_batch(image, probs_images, label, image_no_mask)
+
+            
+
 
 
             self.model_backward_and_update(loss)
